@@ -107,7 +107,7 @@ jobs:
           context: .
           file: ./Dockerfile.bun
           target: ${{ inputs.target_stage }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             OMNIROUTE_USE_TURBOPACK=${{ inputs.use_turbopack }}
