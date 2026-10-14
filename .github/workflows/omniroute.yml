@@ -1,0 +1,66 @@
+name: Build OmniRoute Bun Latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_or_tag:
+        description: 'Nhánh hoặc Tag cụ thể (Để trống = tự lấy nhánh mặc định mới nhất của tác giả)'
+        required: false
+        default: ''
+      target_stage:
+        description: 'Chọn bản build (runner-base: nhẹ ~250MB | runner-web: có sẵn Chromium)'
+        required: false
+        default: 'runner-base'
+        type: choice
+        options:
+          - runner-base
+          - runner-web
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Kéo code mới nhất từ repo gốc diegosouzapw/OmniRoute
+        uses: actions/checkout@v4
+        with:
+          repository: diegosouzapw/OmniRoute
+          ref: ${{ inputs.branch_or_tag }}
+
+      - name: 2. Kiểm tra thông tin phiên bản vừa kéo về
+        run: |
+          echo "Đang build từ commit: $(git rev-parse --short HEAD)"
+          echo "Phiên bản trong package.json: $(jq -r .version package.json)"
+
+      - name: 3. Tự động bơm cấu hình chống tràn RAM vào Dockerfile.bun
+        run: |
+          # Chèn giới hạn worker và RAM ngay trước dòng lệnh build của Dockerfile.bun
+          sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=3 NODE_OPTIONS="--max-old-space-size=6144"\nRUN bun --smol run --quiet build/' Dockerfile.bun
+          echo "--- Kiểm tra đoạn Dockerfile.bun sau khi tối ưu ---"
+          grep -C 3 "bun --smol run" Dockerfile.bun
+
+      - name: 4. Đăng nhập GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 5. Cài đặt Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 6. Build và đẩy Image lên GHCR của bạn
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.bun
+          target: ${{ inputs.target_stage }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/omniroute-bun:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
