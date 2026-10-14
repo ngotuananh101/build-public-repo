@@ -20,6 +20,14 @@ on:
         options:
           - runner-base
           - runner-web
+      use_turbopack:
+        description: 'Bật Turbopack (Nên để 0 - dùng Webpack để tiết kiệm RAM và tránh lỗi OOM)'
+        required: false
+        default: '0'
+        type: choice
+        options:
+          - '0'
+          - '1'
 
 permissions:
   contents: read
@@ -34,48 +42,51 @@ jobs:
           echo "================ THÔNG TIN CPU ================"
           lscpu | grep -E "Model name|Socket|Thread|NUMA|CPU\(s\):" || true
           echo "Tổng số luồng CPU khả dụng: $(nproc)"
-          
           echo ""
           echo "================ THÔNG TIN RAM & SWAP ========="
           free -h
-          
           echo ""
           echo "================ DUNG LƯỢNG Ổ CỨNG ============"
           df -h /
 
-      - name: 2. Kéo code mới nhất từ repo gốc diegosouzapw/OmniRoute
+      - name: 2. Bơm thêm 12GB Swap từ ổ cứng trống (Nâng tổng bộ nhớ lên ~30GB)
+        if: ${{ !inputs.check_only }}
+        run: |
+          sudo fallocate -l 12G /swapfile_extra
+          sudo chmod 600 /swapfile_extra
+          sudo mkswap /swapfile_extra
+          sudo swapon /swapfile_extra
+          echo "--- Bộ nhớ sau khi nâng cấp Swap ---"
+          free -h
+
+      - name: 3. Kéo code mới nhất từ repo gốc diegosouzapw/OmniRoute
         if: ${{ !inputs.check_only }}
         uses: actions/checkout@v4
         with:
           repository: diegosouzapw/OmniRoute
           ref: ${{ inputs.branch_or_tag }}
 
-      - name: 3. Kiểm tra thông tin phiên bản OmniRoute vừa kéo về
+      - name: 4. Kiểm tra thông tin phiên bản OmniRoute vừa kéo về
         if: ${{ !inputs.check_only }}
         run: |
           echo "Đang build từ nhánh/commit: $(git log -1 --format='%h - %s (%ci)')"
           echo "Phiên bản trong package.json: $(jq -r .version package.json)"
 
-      - name: 4. Tự động tính toán và bơm cấu hình tối ưu vào Dockerfile.bun
+      - name: 5. Tối ưu chống tràn RAM (OOM) trong Dockerfile.bun
         if: ${{ !inputs.check_only }}
         run: |
-          # Đọc tổng RAM thực tế của Runner (tính bằng MB)
-          TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-          # Dành lại khoảng 2.5GB (2560MB) cho OS, Docker daemon và tiến trình chính của Bun
-          MAX_OLD_SPACE=$((TOTAL_RAM_MB - 2560))
-          if [ "$MAX_OLD_SPACE" -lt 4096 ]; then MAX_OLD_SPACE=4096; fi
+          # Đặt CIRCLE_NODE_TOTAL=2 (chỉ chạy tối đa 2 worker song song)
+          # Giới hạn mỗi worker Node tối đa 4096MB (4GB) thay vì 6GB+ để không nhân bản tràn RAM
+          # Giới hạn tiến trình chính của Bun (JSC) ở mức 6GB
+          sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=4096" BUN_JSC_forceRAMSize=6442450944\nRUN bun --smol run --quiet build/' Dockerfile.bun
           
-          CPU_CORES=$(nproc)
-          echo "-> Phát hiện Runner có ${CPU_CORES} cores và ${TOTAL_RAM_MB}MB RAM."
-          echo "-> Sẽ cấu hình CIRCLE_NODE_TOTAL=${CPU_CORES} và NODE_OPTIONS=--max-old-space-size=${MAX_OLD_SPACE}"
+          # Giới hạn luồng lúc bun install để tránh spike RAM
+          sed -i 's/RUN bun install --include=optional --quiet/RUN bun install --include=optional --network-concurrency 8/' Dockerfile.bun
 
-          # Chèn cấu hình động vào ngay trước dòng lệnh build trong Dockerfile.bun
-          sed -i "s/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=${CPU_CORES} NODE_OPTIONS=\"--max-old-space-size=${MAX_OLD_SPACE}\"\nRUN bun --smol run --quiet build/" Dockerfile.bun
-          
-          echo "--- Đoạn Dockerfile.bun sau khi được tối ưu ---"
+          echo "--- Kiểm tra Dockerfile.bun sau khi vá chống OOM ---"
           grep -C 3 "bun --smol run" Dockerfile.bun
 
-      - name: 5. Đăng nhập GitHub Container Registry (GHCR)
+      - name: 6. Đăng nhập GitHub Container Registry (GHCR)
         if: ${{ !inputs.check_only }}
         uses: docker/login-action@v3
         with:
@@ -83,11 +94,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 6. Cài đặt Docker Buildx
+      - name: 7. Cài đặt Docker Buildx (Dùng driver docker trực tiếp để nhận diện đủ 30GB RAM+Swap)
         if: ${{ !inputs.check_only }}
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
-      - name: 7. Build và đẩy Image lên GHCR của bạn
+      - name: 8. Build và đẩy Image lên GHCR của bạn
         if: ${{ !inputs.check_only }}
         uses: docker/build-push-action@v6
         with:
@@ -96,7 +109,8 @@ jobs:
           target: ${{ inputs.target_stage }}
           platforms: linux/amd64
           push: true
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=${{ inputs.use_turbopack }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/omniroute-bun:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Lưu ý: với driver: docker, không dùng cache-to gha để tránh tốn thêm RAM đóng gói cache lúc cuối
