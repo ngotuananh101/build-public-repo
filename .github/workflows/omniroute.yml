@@ -1,4 +1,4 @@
-name: Build OmniRoute Bun Latest
+name: Build OmniRoute Bun Latest (Native Fast Multi-Arch)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ on:
           - runner-base
           - runner-web
       use_turbopack:
-        description: 'Bật Turbopack (Nên để 0 - dùng Webpack để tiết kiệm RAM và tránh lỗi OOM)'
+        description: 'Bật Turbopack (Nên để 0 - Webpack nhanh gấp đôi và không bị quét nhầm 16.000 file)'
         required: false
         default: '0'
         type: choice
@@ -34,14 +34,25 @@ permissions:
   packages: write
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+  # ── JOB 1: Chạy song song trên 2 máy chủ vật lý độc lập (1 máy x64 + 1 máy ARM64 thật) ──
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch_tag: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch_tag: arm64
+
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: 1. Kiểm tra cấu hình phần cứng Runner (CPU, RAM, Disk)
+      - name: 1. Kiểm tra cấu hình phần cứng Runner (${{ matrix.arch_tag }})
         run: |
-          echo "================ THÔNG TIN CPU ================"
-          lscpu | grep -E "Model name|Socket|Thread|NUMA|CPU\(s\):" || true
-          echo "Tổng số luồng CPU khả dụng: $(nproc)"
+          echo "================ KIẾN TRÚC MÁY: $(uname -m) ================"
+          lscpu | grep -E "Model name|Architecture|CPU\(s\):" || true
           echo ""
           echo "================ THÔNG TIN RAM & SWAP ========="
           free -h
@@ -49,14 +60,13 @@ jobs:
           echo "================ DUNG LƯỢNG Ổ CỨNG ============"
           df -h /
 
-      - name: 2. Bơm thêm 12GB Swap từ ổ cứng trống (Nâng tổng bộ nhớ lên ~30GB)
+      - name: 2. Bơm thêm 12GB Swap chống OOM tuyệt đối
         if: ${{ !inputs.check_only }}
         run: |
           sudo fallocate -l 12G /swapfile_extra
           sudo chmod 600 /swapfile_extra
           sudo mkswap /swapfile_extra
           sudo swapon /swapfile_extra
-          echo "--- Bộ nhớ sau khi nâng cấp Swap ---"
           free -h
 
       - name: 3. Kéo code mới nhất từ repo gốc diegosouzapw/OmniRoute
@@ -66,27 +76,23 @@ jobs:
           repository: diegosouzapw/OmniRoute
           ref: ${{ inputs.branch_or_tag }}
 
-      - name: 4. Kiểm tra thông tin phiên bản OmniRoute vừa kéo về
+      - name: 4. Tối ưu RAM và vá lỗi gói apt trong Dockerfile.bun
         if: ${{ !inputs.check_only }}
         run: |
-          echo "Đang build từ nhánh/commit: $(git log -1 --format='%h - %s (%ci)')"
-          echo "Phiên bản trong package.json: $(jq -r .version package.json)"
-
-      - name: 5. Tối ưu chống tràn RAM (OOM) trong Dockerfile.bun
-        if: ${{ !inputs.check_only }}
-        run: |
-          # Đặt CIRCLE_NODE_TOTAL=2 (chỉ chạy tối đa 2 worker song song)
-          # Giới hạn mỗi worker Node tối đa 4096MB (4GB) thay vì 6GB+ để không nhân bản tràn RAM
-          # Giới hạn tiến trình chính của Bun (JSC) ở mức 6GB
-          sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=4096" BUN_JSC_forceRAMSize=6442450944\nRUN bun --smol run --quiet build/' Dockerfile.bun
+          echo "Đang build từ commit: $(git log -1 --format='%h - %s (%ci)')"
           
-          # Giới hạn luồng lúc bun install để tránh spike RAM
+          # 1. Khóa số worker và RAM để chạy mượt trên từng máy
+          sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=6144" BUN_JSC_forceRAMSize=6442450944\nRUN bun --smol run --quiet build/' Dockerfile.bun
+          
+          # 2. Giảm tải mạng lúc bun install
           sed -i 's/RUN bun install --include=optional --quiet/RUN bun install --include=optional --network-concurrency 8/' Dockerfile.bun
 
-          echo "--- Kiểm tra Dockerfile.bun sau khi vá chống OOM ---"
-          grep -C 3 "bun --smol run" Dockerfile.bun
+          # 3. Vá lỗi các gói apt đã bị khai tử trên Debian Trixie (nếu bạn chọn runner-web)
+          sed -i '/gconf-service/d' Dockerfile.bun
+          sed -i '/stdc++6/d' Dockerfile.bun
+          sed -i '/fonts-kacst/d' Dockerfile.bun
 
-      - name: 6. Đăng nhập GitHub Container Registry (GHCR)
+      - name: 5. Đăng nhập GitHub Container Registry (GHCR)
         if: ${{ !inputs.check_only }}
         uses: docker/login-action@v3
         with:
@@ -94,26 +100,47 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 7. Cài đặt Docker Buildx (Dùng driver docker trực tiếp để nhận diện đủ 30GB RAM+Swap)
+      - name: 6. Cài đặt Docker Buildx (Dùng driver docker trực tiếp - 100% hiệu năng gốc)
         if: ${{ !inputs.check_only }}
         uses: docker/setup-buildx-action@v3
         with:
-          driver: docker-container
-          driver-opt: |
-            image=moby/buildkit:latest
-            memory=12g
+          driver: docker
 
-      - name: 8. Build và đẩy Image lên GHCR của bạn
+      - name: 7. Build Native và Push nhánh ${{ matrix.arch_tag }}
         if: ${{ !inputs.check_only }}
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.bun
           target: ${{ inputs.target_stage }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
+          provenance: false
           build-args: |
             OMNIROUTE_USE_TURBOPACK=${{ inputs.use_turbopack }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/omniroute-bun:latest
-          # Lưu ý: với driver: docker, không dùng cache-to gha để tránh tốn thêm RAM đóng gói cache lúc cuối
+            ghcr.io/${{ github.repository_owner }}/omniroute-bun:latest-${{ matrix.arch_tag }}
+
+  # ── JOB 2: Gộp 2 bản build (amd64 + arm64) thành 1 tag :latest duy nhất (Chỉ mất 5 giây) ──
+  merge-manifest:
+    needs: build-native
+    if: ${{ !inputs.check_only && success() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Đăng nhập GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 2. Gộp Manifest đa kiến trúc (linux/amd64 + linux/arm64)
+        run: |
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/omniroute-bun"
+          docker buildx imagetools create \
+            -t "${IMAGE_BASE}:latest" \
+            "${IMAGE_BASE}:latest-amd64" \
+            "${IMAGE_BASE}:latest-arm64"
+          
+          echo "=== Kiểm tra Manifest sau khi gộp ==="
+          docker buildx imagetools inspect "${IMAGE_BASE}:latest"
