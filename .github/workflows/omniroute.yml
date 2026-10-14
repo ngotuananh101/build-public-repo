@@ -98,7 +98,10 @@ jobs:
         if: ${{ !inputs.check_only }}
         uses: docker/setup-buildx-action@v3
         with:
-          driver: docker
+          driver: docker-container
+          driver-opt: |
+            image=moby/buildkit:latest
+            memory=12g
 
       - name: 8. Build và đẩy Image lên GHCR của bạn
         if: ${{ !inputs.check_only }}
