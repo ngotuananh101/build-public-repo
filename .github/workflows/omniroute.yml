@@ -1,17 +1,16 @@
-name: Build OmniRoute Bun Latest (Native Fast Multi-Arch)
+name: Build OmniRoute Multi-Arch (Dockerfile & Bun)
 
 on:
   workflow_dispatch:
     inputs:
-      check_only:
-        description: 'Chỉ kiểm tra cấu hình phần cứng Runner (Không chạy build)'
+      dockerfile:
+        description: 'Chọn file Dockerfile để build (Dockerfile: Node.js thuần | Dockerfile.bun: Bun)'
         required: false
-        default: false
-        type: boolean
-      branch_or_tag:
-        description: 'Nhánh hoặc Tag cụ thể (Để trống = tự lấy nhánh mặc định mới nhất của tác giả)'
-        required: false
-        default: ''
+        default: 'Dockerfile'
+        type: choice
+        options:
+          - Dockerfile
+          - Dockerfile.bun
       target_stage:
         description: 'Chọn bản build (runner-base: nhẹ ~250MB | runner-web: có sẵn Chromium)'
         required: false
@@ -21,17 +20,30 @@ on:
           - runner-base
           - runner-web
       use_turbopack:
-        description: 'Bật Turbopack (Nên để 0 - Webpack nhanh gấp đôi và không bị quét nhầm 16.000 file)'
+        description: 'Bật Turbopack (Nên để 0 - Webpack ổn định hơn)'
         required: false
         default: '0'
         type: choice
         options:
           - '0'
           - '1'
+      branch_or_tag:
+        description: 'Nhánh hoặc Tag cụ thể (Để trống = tự lấy nhánh mặc định mới nhất của tác giả)'
+        required: false
+        default: ''
+      check_only:
+        description: 'Chỉ kiểm tra cấu hình phần cứng Runner (Không chạy build)'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
   packages: write
+
+env:
+  # Tên image trên GHCR (Đổi thành omniroute-bun nếu muốn giữ tên cũ trên server)
+  IMAGE_NAME: omniroute
 
 jobs:
   # ── JOB 1: Chạy song song trên 2 máy chủ vật lý độc lập (1 máy x64 + 1 máy ARM64 thật) ──
@@ -76,21 +88,52 @@ jobs:
           repository: diegosouzapw/OmniRoute
           ref: ${{ inputs.branch_or_tag }}
 
-      - name: 4. Tối ưu RAM và vá lỗi gói apt trong Dockerfile.bun
+      - name: 4. Kiểm tra và tối ưu ${{ inputs.dockerfile }}
+        id: prep_dockerfile
         if: ${{ !inputs.check_only }}
         run: |
+          DOCKERFILE="${{ inputs.dockerfile }}"
           echo "Đang build từ commit: $(git log -1 --format='%h - %s (%ci)')"
-          
-          # 1. Khóa số worker và RAM để chạy mượt trên từng máy
-          sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=6144" BUN_JSC_forceRAMSize=6442450944\nRUN bun --smol run --quiet build/' Dockerfile.bun
-          
-          # 2. Giảm tải mạng lúc bun install
-          sed -i 's/RUN bun install --include=optional --quiet/RUN bun install --include=optional --network-concurrency 8/' Dockerfile.bun
+          echo "File Dockerfile được chọn: $DOCKERFILE"
 
-          # 3. Vá lỗi các gói apt đã bị khai tử trên Debian Trixie (nếu bạn chọn runner-web)
-          sed -i '/gconf-service/d' Dockerfile.bun
-          sed -i '/stdc++6/d' Dockerfile.bun
-          sed -i '/fonts-kacst/d' Dockerfile.bun
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error::Không tìm thấy file $DOCKERFILE trong repo!"
+            exit 1
+          fi
+
+          echo "=== Cấu trúc $DOCKERFILE gốc trước khi sửa ==="
+          grep -nE "^(FROM|ARG|ENV|RUN)" "$DOCKERFILE" || true
+
+          if [ "$DOCKERFILE" = "Dockerfile.bun" ]; then
+            echo "-> Áp dụng cấu hình tối ưu cho Bun..."
+            # 1. Khóa số worker và RAM cho Bun
+            sed -i 's/RUN bun run --quiet build/ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=6144" BUN_JSC_forceRAMSize=6442450944\nRUN bun --smol run --quiet build/' "$DOCKERFILE"
+            # 2. Giảm tải mạng lúc bun install
+            sed -i 's/RUN bun install --include=optional --quiet/RUN bun install --include=optional --network-concurrency 8/' "$DOCKERFILE"
+          else
+            echo "-> Áp dụng cấu hình tối ưu cho Node.js thuần..."
+            # 1. Khóa số worker và giới hạn RAM V8 (6GB) trước bước build của npm
+            sed -i -E 's|^RUN npm run (.*build)|ENV CIRCLE_NODE_TOTAL=2 NODE_OPTIONS="--max-old-space-size=6144"\nRUN npm run \1|' "$DOCKERFILE"
+            # 2. Giảm tải kết nối mạng lúc npm ci / npm install
+            sed -i -E 's|^RUN npm (ci\|install)|ENV npm_config_maxsockets=8\nRUN npm \1|' "$DOCKERFILE"
+          fi
+
+          # 3. Vá lỗi các gói apt đã bị khai tử trên Debian Trixie (nếu có)
+          sed -i '/gconf-service/d' "$DOCKERFILE"
+          sed -i '/stdc++6/d' "$DOCKERFILE"
+          sed -i '/fonts-kacst/d' "$DOCKERFILE"
+
+          echo "=== Chi tiết các dòng đã được tối ưu (git diff) ==="
+          git diff "$DOCKERFILE"
+
+          # 4. Tự động kiểm tra xem file có chứa target_stage được chọn hay không
+          if grep -qiE "^FROM .* AS ${{ inputs.target_stage }}\b" "$DOCKERFILE"; then
+            echo "Đã tìm thấy stage: ${{ inputs.target_stage }}"
+            echo "resolved_target=${{ inputs.target_stage }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Không tìm thấy stage '${{ inputs.target_stage }}' trong $DOCKERFILE. Sẽ build stage mặc định cuối cùng."
+            echo "resolved_target=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 5. Đăng nhập GitHub Container Registry (GHCR)
         if: ${{ !inputs.check_only }}
@@ -106,22 +149,22 @@ jobs:
         with:
           driver: docker
 
-      - name: 7. Build Native và Push nhánh ${{ matrix.arch_tag }}
+      - name: 7. Build Native (${{ inputs.dockerfile }}) và Push nhánh ${{ matrix.arch_tag }}
         if: ${{ !inputs.check_only }}
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile.bun
-          target: ${{ inputs.target_stage }}
+          file: ./${{ inputs.dockerfile }}
+          target: ${{ steps.prep_dockerfile.outputs.resolved_target }}
           platforms: ${{ matrix.platform }}
           push: true
           provenance: false
           build-args: |
             OMNIROUTE_USE_TURBOPACK=${{ inputs.use_turbopack }}
           tags: |
-            ghcr.io/${{ github.repository_owner }}/omniroute-bun:latest-${{ matrix.arch_tag }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.arch_tag }}
 
-  # ── JOB 2: Gộp 2 bản build (amd64 + arm64) thành 1 tag :latest duy nhất (Chỉ mất 5 giây) ──
+  # ── JOB 2: Gộp 2 bản build (amd64 + arm64) thành 1 tag :latest duy nhất ──
   merge-manifest:
     needs: build-native
     if: ${{ !inputs.check_only && success() }}
@@ -136,7 +179,7 @@ jobs:
 
       - name: 2. Gộp Manifest đa kiến trúc (linux/amd64 + linux/arm64)
         run: |
-          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/omniroute-bun"
+          IMAGE_BASE="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
           docker buildx imagetools create \
             -t "${IMAGE_BASE}:latest" \
             "${IMAGE_BASE}:latest-amd64" \
